@@ -1,0 +1,256 @@
+---
+title: "Probability of Survival for Expedition Members Survival in the Himalayas"
+output:github_document
+---
+```{r}
+library(tidyverse)
+members <- read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-09-22/members.csv")
+```
+First we will get a brief overview of the data using the skimr package
+```{r}
+# package on left, function on the right
+skimr::skim(members)
+```
+Some key insights from our overview:
+- None of our numeric variables have a gaussian distribution
+- Year is catagorised as a numeric but should be a date 
+- Death cause and injury type have alot of missing values but this is expected, we should impute no injuries or something similar rather than dropping these coloumns as we might use one of these as the outcome value we are predicting 
+
+
+## EDA
+```{r}
+members %>%
+  group_by(year = 10 * (year %/% 10))%>%
+  summarise(died = mean(died),
+            success = mean(success)) %>%
+  pivot_longer(died:success, names_to = "outcome",values_to = "percent") %>%
+  ggplot() +geom_line(aes(x = year, y =percent , colour =outcome )) + 
+  ylab("Decade") +
+  xlab("Outcome") +
+  ggtitle("Trend of Success' and Deaths by Decade") +
+  scale_y_continuous(labels= scales::percent_format())
+  
+```
+The overall trend over time is positive. The chance of successfully reaching the summit is increasing while the death rate is apporach 0%. Compared to near 40% a centuary ago !!. 
+
+Does Age affect your chance? 
+```{r}
+members %>%
+  group_by(age = 5 * (age %/% 5))%>%
+  summarise(died = mean(died),
+            success = mean(success)) %>%
+  pivot_longer(died:success,names_to = "outcome", values_to = "percent") %>%
+  ggplot()+ geom_line(aes(x = age, y = percent, colour = outcome))+ 
+  scale_y_continuous(labels = scales::percent_format())
+
+```
+Suprisingly teenagers have the highest rate of success. By 20 the older you are the less likely you are to succeed in reaching the summit. However, age doesnt seem to factor into death rate at all from teenager to 60. 
+- Past 70 age is a high indictator of death. However this could be due to a tiny number of very old climbers and thus we have a small sample size. 
+
+```{r}
+members %>%
+  count(peak_name,sort = TRUE)
+```
+```{r}
+members %>%
+  # filter out na 
+  filter(!is.na(peak_name)) %>%
+  # we make an other category if the proportion is less than 5%
+  mutate(peak_name = fct_lump(peak_name, prop = 0.05)) %>%
+  # count
+  count(peak_name, sort = TRUE) %>%
+  # group by peak
+  group_by(peak_name) %>%
+  # chart
+  ggplot() + geom_col(aes(reorder(peak_name, n), y = n)) + 
+  coord_flip()
+```
+Go big or go home, the majority of the climbers opted to climb Everest. 
+
+```{r}
+members %>%
+  filter(season != "Unknown") %>%
+  count(season, died) %>%
+  group_by(season) %>%
+  mutate(
+    percent = n / sum(n),
+    died = case_when(
+      died ~ "Died",
+      TRUE ~ "Did not die"
+    )
+  ) %>%
+  ggplot(aes(season, percent, fill = season)) +
+  geom_col(alpha = 0.8, position = "dodge", show.legend = FALSE) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  facet_wrap(~died, scales = "free") +
+  labs(x = NULL, y = "% of expedition members")
+```
+**Winter is Coming** ... Winter has a substanally higher death rate than the other seasons
+
+## Building a Model 
+
+Build our dataset we are going to use 
+```{r}
+members_df <- members %>%
+  # we will drop NA's for these as there were relatively view and it would be hard to impute for
+  filter(season != "Unknown", !is.na(sex), !is.na(citizenship)) %>%
+  # select which columns we want 
+  select(peak_id, year, season, sex, age, citizenship, hired, success, died) %>%
+  # for classification, your outcome must be a factor for tidy models
+  mutate(died = case_when(
+    died ~ "died",
+    TRUE ~ "survived"
+  )) %>%
+  # convert chrs to fct
+  mutate_if(is.character, factor) %>%
+  mutate_if(is.logical, as.integer)
+
+members_df
+```
+
+```{r}
+library(tidymodels)
+
+set.seed(123)
+members_split <- initial_split(members_df, strata = died)
+members_train <- training(members_split)
+members_test <- testing(members_split)
+```
+We need to resample to test our models performance
+```{r}
+set.seed(123)
+members_folds <- vfold_cv(members_train, strata = died)
+members_folds
+```
+## Feature Engineering
+```{r}
+library(themis)
+members_recipe <- recipe(died ~ . ,data = members_train) %>%
+  # impute the median for age 
+  step_impute_median(age) %>%
+  # pools low freq values into other category
+  step_other(peak_id , citizenship)%>%
+  # create dummies for factors not including outcome
+  step_dummy(all_nominal(), -died) %>%
+  # creates new examples of the minority class to balance the class - using nearest neighbous
+  step_smote(died)
+
+```
+
+```{r}
+members_recipe
+
+# Recipe
+# 
+# Inputs:
+# 
+# 
+# Operations:
+# 
+# Median imputation for age
+# Collapsing factor levels for peak_id, citizenship
+# Dummy variables from all_nominal(), -died
+# SMOTE based on died
+```
+To see the data in the recipe 
+
+```{r}
+members_recipe %>%
+  prep() %>%
+  bake(new_data = NULL)
+```
+```{r}
+glm_model = logistic_reg() %>%
+  set_engine("glm")
+
+rf_model = rand_forest(trees = 1000)%>%
+  set_engine("ranger")%>%
+  set_mode("classification")
+```
+
+```{r}
+members_wf <- workflow() %>%
+  add_recipe(members_recipe)
+
+members_wf
+```
+
+```{r}
+# set what metrics we want to compute
+members_metrics <- metric_set(roc_auc, accuracy, yardstick::sensitivity,yardstick::specificity)
+# enable parallel processing for speed
+doParallel::registerDoParallel()
+# add model to our workflow
+glm_rs <- members_wf %>%
+  add_model(glm_model) %>%
+  # fit resamples (folds we made earlier)
+  fit_resamples(
+    resamples = members_folds,
+    metrics = members_metrics,
+    # save predictions so we cant chart
+    control = control_resamples(save_pred = TRUE)
+  )
+
+glm_rs
+```
+```{r}
+rf_rs <- members_wf %>%
+  add_model(rf_model) %>%
+  # fit resamples (folds we made earlier)
+  fit_resamples(
+    resamples = members_folds,
+    metrics = members_metrics,
+    # save predictions so we cant chart
+    control = control_resamples(save_pred = TRUE)
+  )
+
+rf_rs
+```
+
+## Evaluate Models
+```{r}
+collect_metrics(glm_rs)
+```
+```{r}
+collect_metrics(rf_rs)
+```
+Random Forest is extremely poor at finding the miniority case. Finding the people who died. 
+
+
+```{r}
+glm_rs%>%
+  conf_mat_resampled()
+```
+```{r}
+rf_rs%>%
+  conf_mat_resampled()
+```
+We will move forward with our Logistic Regression Model 
+
+```{r}
+glm_rs %>%
+  collect_predictions() %>%
+  group_by(id) %>%
+  roc_curve(died, .pred_died) %>%
+  autoplot()
+```
+```{r}
+members_final <- members_wf %>%
+  add_model(glm_model) %>%
+  last_fit(members_split)
+
+collect_metrics(members_final)
+collect_predictions(members_final )
+```
+```{r}
+collect_predictions(members_final) %>%
+  conf_mat(died, .pred_class)
+```
+```{r}
+members_final %>%
+  pull(.workflow) %>%
+  pluck(1) %>%
+  tidy(exponentiate = TRUE) %>%
+  arrange(estimate) 
+```
+
